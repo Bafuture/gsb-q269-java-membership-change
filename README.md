@@ -1,32 +1,62 @@
-# 集群成员变更组件
+# 集群成员变更组件（联合共识）
 
-Pair-wise GSB 标注任务仓库（第 17 批 / 269）。
+在运行中安全地增删集群节点的 Java 组件。核心思想是**联合共识（joint consensus）**：
+成员变更期间新旧两份配置并存，任何决议必须同时满足两份配置各自的多数派，
+从而保证任何两个合法多数派必然相交，杜绝“两个多数派各自决策”的脑裂。
 
-| 项目 | 内容 |
-|------|------|
-| 任务类型 | Feature 迭代 |
-| 任务难度 | 困难 |
-| 语言/框架 | Java, Maven, JUnit 5 |
-| 环境可复现等级 | 无外部依赖 |
-| 构建方式 | Maven（含 mvnw wrapper，无需本机安装 Maven） |
-
-> 本仓库是**初始环境快照**：只有工程骨架，不含任何实现代码。
-> 分支说明：`main` 为初始环境；`A`、`B` 为两次独立执行各自的工作分支，均从 `main` 的同一个提交拉出。
-
-## 运行方式
+## 构建与测试
 
 ```bash
-./mvnw -q verify
+./mvnw -q verify    # 或 mvn -q verify
 ```
 
-## 任务提示词
+## 组件结构（`com.example.gsb.membership`）
 
-以下为本题完整的 User Prompt 原文，两次执行必须使用完全相同的文本。
+| 类 | 职责 |
+|----|------|
+| `MembershipManager` | 变更流程入口：`proposeChange` → 联合期 `decide` → `commit` |
+| `MembershipState` | 可持久化的完整状态快照（版本、阶段、新旧成员、统计） |
+| `ClusterConfiguration` | 带版本号的成员配置，提供多数派判定 |
+| `MembershipStore` | 持久化抽象；实现：`InMemoryMembershipStore`、`FileMembershipStore`（原子落盘） |
+| `MembershipStats` | 统计：当前版本、新旧配置成员数、联合阶段决议次数、变更耗时 |
 
-我们的集群要在运行中增删节点，但成员变更期间不能出现两个多数派各自决策。请从零实现一个集群成员变更组件。仓库目前只有一个空的 Maven 工程（pom.xml 只声明 JUnit 5 与 AssertJ）。要求：1) 支持成员列表变更（加入与移除），每次变更带配置版本号；2) 支持联合共识简化流程：新旧两份成员配置并存期间，任何决议需要同时满足两份配置的多数派；3) 安全性验证：变更过程中不得出现新旧配置各自形成多数派并作出冲突决议，需构造场景测试证明；4) 支持变更中断恢复：变更过程中节点崩溃，重启后要按当前配置版本继续而不是回到旧配置；5) 支持一次只进行一个变更，重复提交要能识别并拒绝；6) 支持统计：当前配置版本、新旧配置成员数、联合阶段的决议次数与变更耗时；7) 说明一次性替换整个配置的风险，并在 README 给出推荐做法；8) 测试覆盖成员加入与移除、联合多数派约束、变更中断恢复、重复变更拒绝与统计；`mvn -q verify` 一条命令跑通。
+## 变更流程
 
-## 提交要求
+1. **提交变更** `proposeChange(newMembers)`：版本号 +1，进入联合期，状态先持久化再生效。
+   一次只允许一个变更；进行中再次提交抛 `ChangeInProgressException`，
+   目标与当前配置一致抛 `DuplicateChangeException`。
+2. **联合期决议** `decide(votes)`：投票必须同时构成旧配置和新配置的多数派才被接受，
+   并计入联合阶段决议次数。
+3. **提交完成** `commit()`：新配置成为唯一生效配置，记录变更耗时，回到稳定期。
+4. **崩溃恢复**：每次状态迁移（进入联合期、联合期决议、提交完成）都先落盘，
+   重启后用同一 `MembershipStore` 重建 `MembershipManager`，按当前配置版本继续，
+   不会回退到旧配置。
 
-1. 在本仓库中完成提示词要求的全部内容。
-2. `./mvnw -q verify` 必须通过。
-3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+```java
+var store = new FileMembershipStore(Path.of("/var/lib/node/membership.properties"));
+var manager = MembershipManager.bootstrap(store, Set.of(NodeId.of("A"), NodeId.of("B"), NodeId.of("C")));
+
+manager.proposeChange(Set.of(NodeId.of("A"), NodeId.of("B"), NodeId.of("C"), NodeId.of("D"))); // v2 联合期
+boolean ok = manager.decide(votes);   // 需同时满足 {A,B,C} 与 {A,B,C,D} 的多数派
+manager.commit();                     // v2 稳定期
+MembershipStats stats = manager.stats();
+```
+
+## 为什么不要一次性替换整个配置
+
+假设直接把 {A,B,C} 整体切换为 {D,E,F}：切换瞬间无法保证所有节点同时生效，
+{A,B} 仍按旧配置构成多数派、{D,E} 已按新配置构成多数派——两组投票**互不相交**，
+却都能各自通过决议，于是同一时刻出现两个冲突的“合法多数派”（脑裂），
+数据可能产生不可调和的分叉。本组件的
+`JointConsensusSafetyTest.oneShotReplacementWouldAllowTwoDisjointMajorities`
+用测试复现了这一风险。
+
+## 推荐做法
+
+- **生产环境**：采用联合共识（本组件实现的流程），新旧配置并存期间决议需双重多数派；
+  任何两个联合多数派必然相交，冲突决议在数学上不可能发生
+  （见 `JointConsensusSafetyTest.anyTwoAcceptedVoteSetsIntersect` 的穷举验证）。
+- **变更幅度**：优先**单节点步进**（每次只增/删一个节点），把联合期的双重多数派约束
+  降到最低，也便于定位问题；避免整组替换。
+- **一次一个变更**：上一次变更 commit 完成前不发起新变更（组件已强制）。
+- **先持久化后生效**：配置版本与联合状态先落盘再对外生效，崩溃恢复后按当前版本继续。
